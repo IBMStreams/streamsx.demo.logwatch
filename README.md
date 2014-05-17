@@ -1,4 +1,4 @@
-streamsx.sample.logwatch
+streamsx.demo.logwatch
 ========================
 
-Sample SPL application for detecting system breakins.
+Demonstration SPL application for detecting system breakins.
