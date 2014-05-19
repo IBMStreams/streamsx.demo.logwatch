@@ -1,0 +1,51 @@
+namespace streamsx.demo.logwatch.language;
+
+rstring flatten(list<rstring> lst)
+{
+    mutable rstring str = "";
+    for (rstring e in lst) {
+        str += e + " ";
+    }
+    return str;
+}
+
+composite LogWatch {
+    type
+        LogLine = timestamp time, rstring hostname, rstring service, rstring message;
+        Failure = timestamp time, rstring uid, rstring euid, rstring tty, rstring rhost, rstring user;
+
+    graph
+        stream<rstring line> RawLines = FileSource() {
+            param file: "messages_head";
+                  format: line;
+        }
+
+        stream<LogLine> ParsedLines = Custom(RawLines) {
+            logic onTuple RawLines: {
+                list<rstring> tokens = tokenize(line, " ", false);
+                timestamp t = timeStringtoTimestamp(tokens[1] + "-" + upper(tokens[0]) + "-2011", tokens[2] + ".0", true);
+
+                submit({time = t, hostname = tokens[3], service = tokens[4], message = flatten(tokens[5:])}, ParsedLines);
+            }
+        }
+
+        stream<LogLine> RawFailures = Filter(ParsedLines) {
+            param filter: findFirst(service, "sshd", 0) != -1 && findFirst(message, "authentication failure", 0) != -1;
+        }
+
+        stream<Failure> Failures = Custom(RawFailures) {
+            logic onTuple RawFailures: {
+                list<rstring> tokens = tokenize(message, ";", false);
+                list<rstring> values = tokenize(tokens[1], "= ", false);
+
+                submit({time = RawFailures.time, 
+                        uid = values[2], euid = values[4], tty = values[6], rhost = values[9], 
+                        user = size(values) == 12 ? values[11]: ""}, Failures);
+            }
+        }
+
+        () as Output = FileSink(Failures) {
+            param file: "Output.txt";
+                  format: txt;
+        }
+}
