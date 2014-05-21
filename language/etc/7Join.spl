@@ -1,0 +1,114 @@
+namespace streamsx.demo.logwatch.language;
+
+rstring flatten(list<rstring> lst)
+{
+    mutable rstring str = "";
+    for (rstring e in lst) {
+        str += e + " ";
+    }
+    return str;
+}
+
+/* Tuple that represents a suspected breakin. */
+type Suspect = timestamp diff, timestamp last, uint32 attempts, rstring rhost, rstring user;
+
+/* For each remote host, look for failure $attempts in a period of $seconds. */
+composite SuspectFind(input Failure; output Diff) {
+    param
+        expression<uint32> $attempts;
+        expression<float64> $seconds;
+
+    type FailureRange = timestamp max, timestamp min, rstring rhost, rstring user;
+
+    graph
+        stream<FailureRange> Range = Aggregate(Failure) {
+            window Failure: tumbling, count($attempts), partitioned;
+            param partitionBy: rhost;
+            output Range: max = Max(time), min = Min(time), user = Max(user);
+        }
+
+        stream<FailureRange> Cutoff = Filter(Range) {
+            param filter: max - min < (timestamp)$seconds;
+        }
+
+        stream<Suspect> Diff = Functor(Cutoff) {
+            output Diff: diff = max - min, last = max, attempts = $attempts;
+        }
+}
+
+composite LogWatch {
+    param
+        expression<rstring> $file: getSubmissionTimeValue("file");
+
+    type
+        LogLine = timestamp time, rstring hostname, rstring service, rstring message;
+        Failure = timestamp time, rstring uid, rstring euid, rstring tty, rstring rhost, rstring user;
+        Success = timestamp time, rstring user; 
+        Breakin = timestamp time, rstring rhost, rstring user;
+
+    graph
+        stream<rstring line> RawLines = FileSource() {
+            param file: $file;
+                  format: line;
+                  compression: gzip;
+        }
+
+        stream<LogLine> ParsedLines = Custom(RawLines) {
+            logic onTuple RawLines: {
+                list<rstring> tokens = tokenize(line, " ", false);
+                timestamp t = timeStringtoTimestamp(tokens[1] + "-" + upper(tokens[0]) + "-2011", tokens[2] + ".0", true);
+
+                submit({time = t, hostname = tokens[3], service = tokens[4], message = flatten(tokens[5:])}, ParsedLines);
+            }
+        }
+
+        stream<LogLine> RawFailures = Filter(ParsedLines) {
+            param filter: findFirst(service, "sshd", 0) != -1 && findFirst(message, "authentication failure", 0) != -1;
+        }
+
+        stream<Failure> Failures = Custom(RawFailures) {
+            logic onTuple RawFailures: {
+                list<rstring> tokens = tokenize(message, ";", false);
+                list<rstring> values = tokenize(tokens[1], "= ", false);
+
+                submit({time = RawFailures.time, 
+                        uid = values[2], euid = values[4], tty = values[6], rhost = values[9], 
+                        user = size(values) == 12 ? values[11]: ""}, Failures);
+            }
+        }
+
+        stream<Suspect> RealTime = SuspectFind(Failures) {
+            param attempts: 5u;
+                  seconds: 60.0;
+        }
+
+        stream<LogLine> RawSuccesses = Filter(ParsedLines) {
+            param filter: findFirst(service, "sshd", 0) != -1 && findFirst(message, "session opened for user", 0) != -1;
+        }
+
+        stream<Success> Successes = Functor(RawSuccesses) {
+            output Successes: user = tokenize(regexMatch(message, "user .* by")[0], " ", false)[1];
+        }
+
+        stream<Breakin> Breakins = Join(RealTime; Successes) {
+            window RealTime: sliding, count(1);
+                   Successes: sliding, count(1);
+            param match: Successes.user == RealTime.user && diffAsSecs(Successes.time, RealTime.last) < 60.0;
+            output Breakins: time = Successes.time, rhost = RealTime.rhost, user = Successes.user;
+        }
+
+        () as RealTimeOut = FileSink(RealTime) {
+            param file: "RealTime.txt";
+                  format: txt;
+        }
+
+        () as SuccessesOut = FileSink(Successes) {
+            param file: "Successes.txt";
+                  format: txt;
+        }
+
+        () as BreakinsOut = FileSink(Breakins) {
+            param file: "Breakins.txt";
+                  format: txt;
+        }
+}

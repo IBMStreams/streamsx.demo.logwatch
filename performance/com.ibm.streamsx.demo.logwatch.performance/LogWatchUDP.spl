@@ -1,0 +1,369 @@
+/*
+ * LogWatchUDP
+ * Scott Schneider, scott.a.s@us.ibm.com
+ * For use with InfoSphere Streams 3.2 and later.
+ *
+ * For further information, see the README.
+ */
+
+namespace com.ibm.streamsx.demo.logwatch.performance;
+
+/* Given a list of strings, produce one string that is the concatenation of 
+ * them separated by spaces. */
+rstring flatten(list<rstring> lst)
+{
+    mutable rstring str = "";
+    for (rstring e in lst) {
+        str += e + " ";
+    }
+    return str;
+}
+
+/* Merges tuples that come out of a UDP region. If this composite is placed immediately
+ * after a UDP region, all of the parallel channels will fan-in to the In stream. This 
+ * merge assumes that:
+ *   1. The tuples contain a $key attribute of type uint64 which uniquely identifies tuples,
+ *      and numeric order of the $key attribute indicates the order of the tuples.
+ *   2. No tuples are "lost" in the UDP region; 1 tuple leaves the region for every tuple 
+ *      that enters.
+ */
+composite UDPMerge(input In; output Out) {
+    param attribute $key;
+
+    graph
+        stream<In> Out = Custom(In) {
+            logic
+            state: {
+                mutable map<uint64, tuple<In>> _tuples;
+                mutable uint64 _next = 1;
+            }
+
+            onTuple In: {
+                if (_next == $key) {
+                    submit(In, Out);
+                    ++_next;
+
+                    while (_next in _tuples) {
+                        submit(_tuples[_next], Out);
+                        removeM(_tuples, _next);
+                        ++_next;
+                    }
+                }
+                else {
+                    _tuples[$key] = In;
+                }
+            }
+        }
+}
+
+/* Tuple that represents a suspected breakin. */
+type Suspect = timestamp diff, timestamp last, uint32 attempts, rstring rhost, rstring user;
+
+/* For each remote host, look for failure $attempts in a period of $seconds. */
+composite SuspectFind(input Failure; output Diff) {
+    param
+        expression<uint32> $attempts;
+        expression<float64> $seconds;
+
+    type FailureRange = timestamp max, timestamp min, rstring rhost, rstring user;
+
+    graph
+        stream<FailureRange> Range = Aggregate(Failure) {
+            window Failure: tumbling, count($attempts), partitioned;
+            param partitionBy: rhost;
+            output Range: max = Max(time), min = Min(time), user = Max(user);
+            config threadedPort: queue(Failure, Sys.Wait);
+        }
+
+        stream<FailureRange> Cutoff = Filter(Range) {
+            param filter: max - min < (timestamp)$seconds;
+            config threadedPort: queue(Range, Sys.Wait);
+        }
+
+        stream<Suspect> Diff = Functor(Cutoff) {
+            output Diff: diff = max - min, last = max, attempts = $attempts;
+        }
+}
+
+composite LogWatchUDP {
+    param expression<rstring> $file: getSubmissionTimeValue("file");
+
+    type
+        LogLine = uint64 seqno, timestamp time, rstring hostname, rstring service, rstring message;
+        Failure = uint64 seqno, timestamp time, rstring uid, rstring euid, rstring tty, rstring rhost, rstring user;
+        Success = uint64 seqno, timestamp time, rstring user; 
+        Breakin = timestamp time, rstring rhost, rstring user;
+
+    graph
+        (stream<rstring ifile> InFile; stream<timestamp start> Start) = Custom() {
+            logic onProcess: {
+                submit({start = getTimestamp()}, Start);
+                submit({ifile = $file}, InFile);
+            }
+            config placement: partitionColocation("FileReadingPE");
+        }
+
+        stream<rstring line> RawLines = FileSource(InFile) {
+            param format: line;
+                  compression: gzip;
+            config placement: partitionColocation("FileReadingPE");
+                   threadedPort: queue(InFile, Sys.Wait);
+        }
+
+        (stream<uint64 seqno, rstring line> RawLinesFinal; stream<uint64 total> TotalCount) = Custom(RawLines) {
+            logic 
+            state: {
+                mutable uint64 _count = 0;
+            }
+
+            onTuple RawLines: {
+                ++_count;
+                submit({seqno=_count, line=RawLines.line}, RawLinesFinal);
+            }
+
+            onPunct RawLines: {
+                if (currentPunct() == Sys.WindowMarker) {
+                    submit(Sys.FinalMarker, RawLinesFinal);
+                    submit({total = _count}, TotalCount);
+                }
+                else {
+                    submit(currentPunct(), RawLinesFinal);
+                }
+            }
+
+            config placement: partitionColocation("FileReadingPE"), host(nodes[2]);
+                   threadedPort: queue(RawLines, Sys.Wait);
+        }
+
+        // Process the raw log line into a service-agnostic tuple.
+        @parallel(width=7)
+        stream<LogLine> ParsedLines = Custom(RawLinesFinal) {
+            logic onTuple RawLinesFinal: {
+                list<rstring> tokens = tokenize(line, " ", false);
+                timestamp t = timeStringToTimestamp(tokens[1] + "-" + 
+                                                    upper(tokens[0]) + "-2011", 
+                                                    tokens[2] + ".000", false);
+
+                submit({seqno = RawLinesFinal.seqno,
+                        time = t, hostname = tokens[3], service = tokens[4], 
+                        message = flatten(tokens[5:])}, 
+                       ParsedLines);
+            }
+            config placement: host(nodes[0]);
+        }
+
+        stream<LogLine> ParsedLinesMerged = UDPMerge(ParsedLines) {
+            param key: ParsedLines.seqno;
+            config placement: host(nodes[4]);
+        }
+        
+        // Find all of the sshd authentication failures.
+        stream<LogLine> RawFailures = Filter(ParsedLinesMerged) {
+            param filter: findFirst(service, "sshd", 0) != -1 && 
+                          findFirst(message, "authentication failure", 0) != -1;
+            config placement: partitionColocation("RawFailuresPE");
+        }
+
+        stream<LogLine> RawFailuresMarked = Functor(RawFailures) {
+            logic
+            state: {
+                mutable uint64 _count = 0;
+            }
+
+            onTuple RawFailures: {
+                ++_count;
+            }
+
+            output RawFailuresMarked: seqno = _count;
+            config placement: partitionColocation("RawFailuresPE"), host(nodes[2]);
+                   threadedPort: queue(RawFailures, Sys.Wait);
+        }
+
+        // Process the authentication failure messages into tuples.
+        @parallel(width=4)
+        stream<Failure> Failures = Custom(RawFailuresMarked) {
+            logic onTuple RawFailuresMarked: {
+                list<rstring> tokens = tokenize(message, ";", false);
+                list<rstring> values = tokenize(tokens[1], "= ", false);
+
+                submit({seqno = RawFailuresMarked.seqno, time = RawFailuresMarked.time, uid = values[2], 
+                        euid = values[4], tty = values[6], rhost = values[9], 
+                        user = size(values) == 12 ? values[11]: ""}, 
+                       Failures);
+            }
+            config placement: host(nodes[1]);
+        }
+
+        stream<Failure> FailuresMerged = UDPMerge(Failures) {
+            param key: Failures.seqno;
+            config placement: partitionColocation("SuspectsPE");
+        }
+
+        stream<Suspect> RealTime = SuspectFind(FailuresMerged) {
+            param attempts: 5u;
+                  seconds: 60.0;
+            config placement: partitionColocation("SuspectsPE"), host(nodes[3]);
+        }
+
+        // Find all of the successful logins.
+        stream<LogLine> RawSuccesses = Filter(ParsedLinesMerged) {
+            param filter: findFirst(service, "sshd", 0) != -1 && 
+                          findFirst(message, "session opened for user", 0) != -1;
+            config placement: partitionColocation("SuccessesBreakinsPE");
+        }
+
+        // Who logged in?
+        stream<Success> Successes = Functor(RawSuccesses) {
+            output Successes: user = tokenize(regexMatch(message, "user .* by")[0], " ", false)[1];
+            config placement: partitionColocation("SuccessesBreakinsPE");
+                   threadedPort: queue(RawSuccesses, Sys.Wait);
+        }
+
+        stream<Breakin> Breakins = Custom(RealTime; Successes) {
+            logic 
+            state: {
+                mutable map<rstring, list<tuple<RealTime>>> suspects = {};
+                mutable map<rstring, list<tuple<Successes>>> logins = {};
+            }
+
+            onTuple RealTime: {
+                if (RealTime.user in logins) {
+                    mutable int32 i = 0;
+                    mutable int32 stale = 0;
+                    mutable boolean matched = false;
+                    while (i < size(logins[RealTime.user])) {
+                        float64 diff = diffAsSecs(logins[RealTime.user][i].time, RealTime.last);
+                        if (0.0 <= diff && diff <= 60.0) {
+                            submit({time = logins[RealTime.user][i].time, 
+                                    rhost = RealTime.rhost, 
+                                    user = RealTime.user}, 
+                                Breakins);
+                            removeM(logins[RealTime.user], i);
+                            matched = true;
+                            stale--;
+                            break;
+                        }
+                        else if (diff > 60.0) {
+                            stale = i;
+                        }
+                        i++;
+                    }
+
+                    if (stale > 0) {
+                        removeM(logins[RealTime.user], 0, stale);
+                    }
+
+                    if (!matched) {
+                        if (!(RealTime.user in suspects)) {
+                            suspects[RealTime.user] = (list<RealTime>)[];
+                        }
+                        appendM(suspects[RealTime.user], RealTime);
+                    }
+                }
+                else if (RealTime.user != "") {
+                    if (!(RealTime.user in suspects)) {
+                        suspects[RealTime.user] = (list<RealTime>)[];
+                    }
+                    appendM(suspects[RealTime.user], RealTime);
+                }
+            }
+
+            onTuple Successes: {
+                if (Successes.user in suspects) {
+                    mutable int32 i = 0;
+                    mutable int32 stale = 0;
+                    mutable boolean matched = false;
+                    while (i < size(suspects[Successes.user])) {
+                        float64 diff = diffAsSecs(Successes.time, suspects[Successes.user][i].last); 
+                        if (0.0 <= diff && diff <= 60.0) {
+                            submit({time = Successes.time, 
+                                    rhost = suspects[Successes.user][i].rhost, 
+                                    user = Successes.user}, 
+                                Breakins);
+                            removeM(suspects[Successes.user], i);
+                            stale--;
+                            matched = true;
+                            break;
+                        }
+                        else if (diff > 60.0) {
+                            stale = i;
+                        }
+                        i++;
+                    }
+
+                    if (stale > 0) {
+                        removeM(suspects[Successes.user], 0, stale);
+                    }
+
+                    if (!matched) {
+                        if (!(Successes.user in logins)) {
+                            logins[Successes.user] = (list<Successes>)[];
+                        }
+                        appendM(logins[Successes.user], Successes);
+                    }
+                }
+                else {
+                    if (!(Successes.user in logins)) {
+                        logins[Successes.user] = (list<Successes>)[];
+                    }
+                    appendM(logins[Successes.user], Successes);
+                }
+            }
+            config placement: partitionColocation("SuccessesBreakinsPE");
+                   threadedPort: queue(Successes, Sys.Wait);
+        }
+
+        () as BreakinsWriter = FileSink(Breakins) {
+            param file: "Breakins.txt";
+                  format: txt;
+            config placement: partitionColocation("SuccessesBreakinsPE"), host(nodes[4]);
+                   threadedPort: queue(Breakins, Sys.Wait);
+        }
+
+        stream<float64 time, uint64 total, float64 throughput> ExecTime = Custom(Start; Breakins; TotalCount) {
+            logic
+            state: {
+                timestamp zero = createTimestamp(0l, 0u);
+                mutable timestamp _start = zero;
+                mutable timestamp _finish = zero;
+                mutable uint64 _count = 0lu;
+            }
+            
+            onTuple Start: {
+                _start = start;
+                if (_finish != zero && _count != 0lu) {
+                    float64 diff = diffAsSecs(_finish, _start);
+                    submit({time = diff, total = _count, throughput = (float64)_count/diff}, ExecTime);
+                }
+            }
+
+            onTuple TotalCount: {
+                _count = TotalCount.total;
+                if (_start != zero && _finish != zero) {
+                    float64 diff = diffAsSecs(_finish, _start);
+                    submit({time = diff, total = _count, throughput = (float64)_count/diff}, ExecTime);
+                }
+            }
+
+            onPunct Breakins: {
+                if (currentPunct() == Sys.FinalMarker) {
+                    _finish = getTimestamp();
+                    if (_start != zero && _count != 0lu) {
+                        float64 diff = diffAsSecs(_finish, _start);
+                        submit({time = diff, total = _count, throughput = (float64)_count/diff}, ExecTime);
+                    }
+                }
+            }
+            config placement: partitionColocation("TimeSinkPE");
+        }
+
+        () as ExecTimeWriter = FileSink(ExecTime) {
+            param file: "ExecTime.txt";
+                  format: txt;
+                  flush: 1u;
+            config placement: partitionColocation("TimeSinkPE"), host(nodes[2]);
+                   threadedPort: queue(ExecTime, Sys.Wait);
+        }
+
+        config hostPool: nodes = createPool({size=5u}, Sys.Exclusive);
+}

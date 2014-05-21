@@ -1,0 +1,96 @@
+namespace com.ibm.streamsx.demo.logwatch.language;
+
+composite DeterministicJoin(input RealTime, Successes; output Breakins) {
+    param type $otype;
+    graph
+        stream<$otype> Breakins = Custom(RealTime; Successes) {
+            logic state: {
+                    mutable map<rstring, list<tuple<RealTime>>> suspects = {};
+                    mutable map<rstring, list<tuple<Successes>>> logins = {};
+            }
+
+            onTuple RealTime: {
+                if (RealTime.user in logins) {
+                    mutable int32 i = 0;
+                    mutable int32 stale = 0;
+                    mutable boolean matched = false;
+                    while (i < size(logins[RealTime.user])) {
+                        float64 diff = diffAsSecs(logins[RealTime.user][i].time, RealTime.last);
+                        if (0.0 <= diff && diff <= 60.0) {
+                            submit({time = logins[RealTime.user][i].time, 
+                                    rhost = RealTime.rhost, 
+                                    user = RealTime.user}, 
+                                Breakins);
+                            removeM(logins[RealTime.user], i);
+                            matched = true;
+                            stale--;
+                            break;
+                        }
+                        else if (diff > 60.0) {
+                            stale = i;
+                        }
+                        i++;
+                    }
+
+                    if (stale > 0) {
+                        removeM(logins[RealTime.user], 0, stale);
+                    }
+
+                    if (!matched) {
+                        if (!(RealTime.user in suspects)) {
+                            suspects[RealTime.user] = (list<RealTime>)[];
+                        }
+                        appendM(suspects[RealTime.user], RealTime);
+                    }
+                }
+                else if (RealTime.user != "") {
+                    if (!(RealTime.user in suspects)) {
+                        suspects[RealTime.user] = (list<RealTime>)[];
+                    }
+                    appendM(suspects[RealTime.user], RealTime);
+                }
+            }
+
+            onTuple Successes: {
+                if (Successes.user in suspects) {
+                    mutable int32 i = 0;
+                    mutable int32 stale = 0;
+                    mutable boolean matched = false;
+                    while (i < size(suspects[Successes.user])) {
+                        float64 diff = diffAsSecs(Successes.time, suspects[Successes.user][i].last); 
+                        if (0.0 <= diff && diff <= 60.0) {
+                            submit({time = Successes.time, 
+                                    rhost = suspects[Successes.user][i].rhost, 
+                                    user = Successes.user}, 
+                                Breakins);
+                            removeM(suspects[Successes.user], i);
+                            stale--;
+                            matched = true;
+                            break;
+                        }
+                        else if (diff > 60.0) {
+                            stale = i;
+                        }
+                        i++;
+                    }
+
+                    if (stale > 0) {
+                        removeM(suspects[Successes.user], 0, stale);
+                    }
+
+                    if (!matched) {
+                        if (!(Successes.user in logins)) {
+                            logins[Successes.user] = (list<Successes>)[];
+                        }
+                        appendM(logins[Successes.user], Successes);
+                    }
+                }
+                else {
+                    if (!(Successes.user in logins)) {
+                        logins[Successes.user] = (list<Successes>)[];
+                    }
+                    appendM(logins[Successes.user], Successes);
+                }
+            }
+        }
+}

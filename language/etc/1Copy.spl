@@ -1,0 +1,14 @@
+namespace streamsx.demo.logwatch.language;
+
+composite LogWatch {
+    graph
+        stream<rstring line> RawLines = FileSource() {
+            param file: "messages_head";
+                  format: line;
+        }
+
+        () as Output = FileSink(RawLines) {
+            param file: "Output.txt";
+                  format: txt;
+        }
+}

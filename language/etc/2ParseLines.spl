@@ -1,0 +1,35 @@
+namespace streamsx.demo.logwatch.language;
+
+rstring flatten(list<rstring> lst)
+{
+    mutable rstring str = "";
+    for (rstring e in lst) {
+        str += e + " ";
+    }
+    return str;
+}
+
+composite LogWatch {
+    type
+        LogLine = timestamp time, rstring hostname, rstring service, rstring message;
+
+    graph
+        stream<rstring line> RawLines = FileSource() {
+            param file: "messages_head";
+                  format: line;
+        }
+
+        stream<LogLine> ParsedLines = Custom(RawLines) {
+            logic onTuple RawLines: {
+                list<rstring> tokens = tokenize(line, " ", false);
+                timestamp t = timeStringtoTimestamp(tokens[1] + "-" + upper(tokens[0]) + "-2011", tokens[2] + ".0", true);
+
+                submit({time = t, hostname = tokens[3], service = tokens[4], message = flatten(tokens[5:])}, ParsedLines);
+            }
+        }
+
+        () as Output = FileSink(ParsedLines) {
+            param file: "Output.txt";
+                  format: txt;
+        }
+}
